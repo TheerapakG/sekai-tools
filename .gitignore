@@ -1,0 +1,8 @@
+asset
+global-metadata
+textures
+master-data.json
+system-info.json
+user-data.json
+vgmstream-cli
+.env
