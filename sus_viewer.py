@@ -301,6 +301,7 @@ def aspect(img: pyglet.image.Texture, b: tuple[int, int], *, fit=True):
     return (int(s * ix), int(s * iy))
 
 window = Window(width=1280, height=720)
+fps_display = pyglet.window.FPSDisplay(window=window)
 keys = key.KeyStateHandler()
 window.push_handlers(keys)
 
@@ -316,8 +317,9 @@ for p in Path("./media").iterdir():
         continue
     media[str(p.relative_to(Path("./media")).with_suffix(""))] = pyglet.resource.media(str(p.relative_to(".")), streaming=False)
 
-music = pyglet.media.load(music_path)
-music_player = None
+music = pyglet.media.load(music_path, streaming=False)
+music_player = pyglet.media.Player()
+music_player.queue(music)
 
 skew_vertex_source = """#version 150 core
     in vec3 translate;
@@ -407,7 +409,10 @@ notes_textures = {
     for tex in NOTES_TEX
 }
 
-judge_line_imaginary_y = 1 / ((1 / 120) + (1 / 600) * (-0.95))
+judge_line_y = 120
+judge_line_imaginary_y = 1 / ((1 / judge_line_y) + (1 / 600) * (-0.95))
+end_imaginary_y = 600 / 0.05 / 2
+end_y = (1 + (-0.95 / ((600 / end_imaginary_y) + 0.95))) * end_imaginary_y
 judge_line_offset_s = judge_line_imaginary_y / 10.8 / 400
 
 y_multiplier = 10.8 * 500
@@ -417,6 +422,8 @@ sprites = []
 batch = pyglet.graphics.Batch()
 
 def activate_note(data):
+    if pause:
+        return
     sound = []
     if data[-1].intersection({"flick_up", "flick_upleft", "flick_upright"}):
         sound.append("flick")
@@ -499,7 +506,7 @@ def draw_hold(hold_data, y):
         mid_texture = textures[mid_texture]
         last_y = (last_data[1] - hold_data[0][1]) * y_multiplier + y
         this_y = (data[1] - hold_data[0][1]) * y_multiplier + y
-        if last_y + 93 < judge_line_imaginary_y and this_y + 93 < judge_line_imaginary_y or last_y + 93 > 600 / 0.05 / 2.5 and this_y + 93 > 600 / 0.05 / 2.5:
+        if last_y + 93 < judge_line_imaginary_y and this_y + 93 < judge_line_imaginary_y or last_y + 93 > end_imaginary_y and this_y + 93 > end_imaginary_y:
             last_data = data
             continue
         last_x_l = 125 + ((1280 - 250) / 12) * last_data[2][-3]
@@ -515,17 +522,19 @@ def draw_hold(hold_data, y):
             last_x_l = (this_x_l - last_x_l) * y_ratio + last_x_l
             last_x_r = (this_x_r - last_x_r) * y_ratio + last_x_r
             last_y = judge_line_imaginary_y - 93
-        if this_y + 93 > 600 / 0.05 / 2.5:
-            y_ratio = (600 / 0.05 / 2.5 - last_y - 93) / (this_y - last_y)
+        if this_y + 93 > end_imaginary_y:
+            y_ratio = (end_imaginary_y - last_y - 93) / (this_y - last_y)
             if "hold_ease_in" in last_data[2][-1]:
                 y_ratio = y_ratio ** 2
             elif "hold_ease_out" in last_data[2][-1]:
                 y_ratio = 1 - ((1 - y_ratio) ** 2)
             this_x_l = (this_x_l - last_x_l) * y_ratio + last_x_l
             this_x_r = (this_x_r - last_x_r) * y_ratio + last_x_r
-            this_y = 600 / 0.05 / 2.5 - 93
+            this_y = end_imaginary_y - 93
+        last_real_y = (1 + (-0.95 / ((600 / (last_y + 93)) + 0.95))) * (last_y + 93)
+        this_real_y = (1 + (-0.95 / ((600 / (this_y + 93)) + 0.95))) * (this_y + 93)
         min_portion = 8 if last_data[2][-1].intersection({"hold_ease_in", "hold_ease_out"}) else 1
-        portion = max(round((this_y - last_y) / (600 / 0.05 / 2.5 - judge_line_imaginary_y) * 128), min_portion)
+        portion = max(round((this_real_y - last_real_y) / (end_y - judge_line_y) * 32), min_portion)
         ratios = [i / portion for i in range(portion + 1)]
         if "hold_ease_in" in last_data[2][-1]:
             x_ratios = [ratio**2 for ratio in ratios]
@@ -561,7 +570,7 @@ def draw_hold(hold_data, y):
                 if mid_data[:-1] not in activated:
                     activate_note(mid_data)
                 continue
-            if mid_y > 600 / 0.05 / 2.5:
+            if mid_y > end_imaginary_y:
                 continue
             mid_ratio = (mid_y - last_y) / (this_y - last_y)
             if "hold_ease_in" in last_data[2][-1]:
@@ -576,21 +585,35 @@ def draw_hold(hold_data, y):
         mids = []
         last_data = data
 
+bg_sprites = []
+bg_batch = pyglet.graphics.Batch()
+sx, sy = aspect(textures["bg_default"], (1280, 720))
+sprite = pyglet.sprite.Sprite(textures["bg_default"], 640 - sx // 2, 360 - sy // 2, batch=bg_batch)
+sprite.scale_x = sx / textures["bg_default"].width
+sprite.scale_y = sy / textures["bg_default"].height
+bg_sprites.append(sprite)
+sx, sy = aspect(textures["lane_base"], (1280, 600))
+sprite = pyglet.sprite.Sprite(textures["lane_base"], 640 - sx // 2, 300 - sy // 2, batch=bg_batch)
+sprite.scale_x = sx / textures["lane_base"].width
+sprite.scale_y = sy / textures["lane_base"].height
+bg_sprites.append(sprite)
+sx, sy = aspect(textures["lane_line"], (1280, 600))
+sprite = pyglet.sprite.Sprite(textures["lane_line"], 640 - sx // 2, 300 - sy // 2, batch=bg_batch)
+sprite.scale_x = sx / textures["lane_line"].width
+sprite.scale_y = sy / textures["lane_line"].height
+bg_sprites.append(sprite)
+sx, sy = aspect(textures["judge_line"], (845, 60))
+sprite = pyglet.sprite.Sprite(textures["judge_line"], 640 - sx // 2, 120, batch=bg_batch)
+sprite.scale_x = sx / textures["judge_line"].width
+sprite.scale_y = sy / textures["judge_line"].height
+bg_sprites.append(sprite)
 
 @window.event
 def on_draw():
     gl.glEnable(gl.GL_BLEND)
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
     window.clear()
-    
-    sx, sy = aspect(textures["bg_default"], (1280, 720))
-    textures["bg_default"].blit(640 - sx / 2, 360 - sy / 2, width=sx, height=sy)
-    sx, sy = aspect(textures["lane_base"], (1280, 600))
-    textures["lane_base"].blit(640 - sx / 2, 300 - sy / 2, width=sx, height=sy)
-    sx, sy = aspect(textures["lane_line"], (1280, 600))
-    textures["lane_line"].blit(640 - sx / 2, 300 - sy / 2, width=sx, height=sy)
-    sx, sy = aspect(textures["judge_line"], (845, 60))
-    textures["judge_line"].blit(640 - sx / 2, 120, width=sx, height=sy)
+    bg_batch.draw()
 
     global offset_time
     global previous_time
@@ -605,18 +628,18 @@ def on_draw():
         offset_time += current_time - previous_time
 
     global music_player
-    if not music_player and not pause and music_offset + offset_time > 0:
-        music.seek(music_offset + offset_time - judge_line_offset_s)
-        music_player = music.play()
+    if not music_player.playing and not pause and music_offset + offset_time - judge_line_offset_s > 0:
+        music_player.seek(music_offset + offset_time - judge_line_offset_s)
+        music_player.play()
 
     if offset_time < 0:
         offset_y = offset_time
         speed = 1
-        offset_end_y = offset_y + (600 / 0.05 / 2.5) / y_multiplier
+        offset_end_y = offset_y + end_imaginary_y / y_multiplier
     else:
         base_time, offset_y, speed = y_lookup[bisect.bisect_right(y_lookup, offset_time, key=lambda e: e[0]) - 1]
         offset_y += (offset_time - base_time) * speed
-        offset_end_y = offset_y + (600 / 0.05 / 2.5) / y_multiplier
+        offset_end_y = offset_y + end_imaginary_y / y_multiplier
     if offset_end_y < 0:
         offset_end_time = offset_end_y
     else:
@@ -653,7 +676,7 @@ def on_draw():
                         # start / end
                         for begin, real_y, data in [hold_data[0], hold_data[-1]]:
                             head_y = (real_y - offset_y) * y_multiplier
-                            if head_y < 0 or head_y > 600 / 0.05 / 2.5:
+                            if head_y < 0 or head_y > end_imaginary_y:
                                 continue
                             draw_note((begin, *data), head_y)
                     case _:
@@ -664,23 +687,21 @@ def on_draw():
 
     activated.add(True)
     previous_time = current_time
+    fps_display.draw()
 
 @window.push_handlers
 def on_key_press(symbol, modifiers):
     global pause
     global music_player
+    global activated
     if symbol == key.SPACE:
         pause = not pause
         if not pause:
-            if music_offset + offset_time > 0:
-                if music_player:
-                    music_player.delete()
-                music.seek(music_offset + offset_time - judge_line_offset_s)
-                music_player = music.play()
+            if music_offset + offset_time - judge_line_offset_s > 0:
+                music_player.seek(music_offset + offset_time - judge_line_offset_s)
+                music_player.play()
         else:
             activated = set()
-            if music_player:
-                music_player.delete()
-                music_player = None
+            music_player.pause()
 
 pyglet.app.run()
