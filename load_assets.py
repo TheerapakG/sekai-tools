@@ -124,7 +124,8 @@ if __name__ == "__main__":
         # "live/2dmode/background/default",
         # "live/note/default",
         "live/tap_se/default",
-        "music/long/se_0333_01"
+        "music/long/se_0333_01",
+        "music/long/se_0321_01"
     ])
     
     asset_bundles.extend((bundle.bundle_name 

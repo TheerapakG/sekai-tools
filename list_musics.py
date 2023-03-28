@@ -4,6 +4,7 @@ from pjsekai.enums.unknown import Unknown
 from pjsekai.client import Client
 import datetime
 import os
+from collections import defaultdict
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -45,6 +46,22 @@ if resource_boxes := client.master_data.resource_boxes:
                     if (detail.resource_type == ResourceType.MUSIC) and (resource_id := detail.resource_id):
                         music_resource_boxes_dict[resource_id] = resource_box
 
+TAG = {
+    "vocaloid": "vir",
+    "light_music_club": "leo",
+    "idol": "mor",
+    "street": "viv",
+    "theme_park": "won",
+    "school_refusal": "25j",
+    "other": "oth",
+}
+
+music_tags: defaultdict[int, set[str]] = defaultdict(set)
+if tags := client.master_data.music_tags:
+    for tag in tags:
+        if (music_id := tag.music_id) and (music_tag := tag.music_tag):
+            music_tags[music_id].add(music_tag)
+
 if musics := client.master_data.musics:
     unreleased_musics = filter(lambda music: music.published_at and music.published_at > datetime.datetime.now(datetime.timezone.utc), musics)
     # unreleased_musics = musics
@@ -52,7 +69,8 @@ if musics := client.master_data.musics:
         music_published_at = unreleased_music.published_at.date() if unreleased_music.published_at else None
         music_id = unreleased_music.id
         music_categories = [category for category in unreleased_music.categories if category != MusicCategory.IMAGE] if unreleased_music.categories else []
-        music_categories_str = f"[{'|'.join([CATEGORY[category.value] for category in music_categories if category.value and CATEGORY.get(category.value)])}]"if music_categories else ""    
+        music_categories_str = f"[{'|'.join([CATEGORY[category.value] for category in music_categories if category.value and CATEGORY.get(category.value)])}]"if music_categories else ""
+        music_tags_str = f"[{'|'.join([name for tag, name in TAG.items() if tag in music_tags[music_id]])}]" if music_id and music_tags[music_id] else None
         music_resource_box = music_resource_boxes_dict.get(music_id) if music_id else None
         music_resource_box_id = music_resource_box.id if music_resource_box else None
         music_ids_str = " ".join([s for s in [f'm: {music_id}' if music_id else '', f'r: {music_resource_box_id}' if music_resource_box_id else ''] if s])
@@ -83,6 +101,7 @@ if musics := client.master_data.musics:
                 in [
                     f"**{unreleased_music.title}**",
                     music_categories_str,
+                    music_tags_str,
                     str(music_published_at)
                 ]
                 if s
