@@ -1,19 +1,29 @@
+import argparse
 from collections import defaultdict
+import ctypes
 from fractions import Fraction
 from io import TextIOWrapper
 import bisect
+import numpy as np
 from pathlib import Path
 import re
 import shlex
-from typing import TypeVar
+import subprocess
+from typing import Any, TypeVar
 import math
 import heapq
 
-chart_id = "0329"
+parser = argparse.ArgumentParser()
+parser.add_argument("-v", "--video", action="store_true")
+parser.add_argument("-a", "--audio", action="store_true")
+
+args = parser.parse_args()
+
+chart_id = "0317" # "0329"
 unit = "vs"
 sus_path = f"./asset/assets/sekai/assetbundle/resources/startapp/music/music_score/{chart_id}_01/master.txt"
 music_path = f"./asset/assets/sekai/assetbundle/resources/ondemand/music/long/{unit}_{chart_id}_01/{unit}_{chart_id}_01; {unit}_{chart_id}_01_SCREEN; {unit}_{chart_id}_01_VR.wav"
-music_offset = 9.010000228881836
+music_offset = 7.8653998374938965 # 9.010000228881836
 
 TAPS = [None, "normal", "critical", "hold_ignore", None] # type: list[str | None]
 TAPS_0 = [None, None, None, None, "skill"] # type: list[str | None]
@@ -358,13 +368,16 @@ import pyglet.sprite
 from pyglet.graphics.shader import Shader, ShaderProgram
 import pyglet.gl as gl
 
-import time
+import ffmpeg
 
 pause = True
-offset_time = -1
+lead_time = 1
+follow_time = 1
+previous_offset_time = -lead_time
+offset_time = -lead_time
 offset_y = 0
-previous_time = time.perf_counter()
-current_time = time.perf_counter()
+previous_time = 0
+current_time = 0
 
 def aspect(img: pyglet.image.Texture, b: tuple[int, int], *, fit=True):
     bx, by = b
@@ -391,22 +404,43 @@ textures["notes_long_among_crtcl"].anchor_x = textures["notes_long_among_crtcl"]
 textures["notes_long_among_crtcl"].anchor_y = textures["notes_long_among_crtcl"].height / 2
 
 media = {} # type: dict[str, pyglet.media.StaticSource]
+media_np = {} # type: dict[str, np.ndarray[Any, np.dtype[np.int16]]]
 for p in Path("./media").iterdir():
     if not p.is_file():
         continue
     media[str(p.relative_to(Path("./media")).with_suffix(""))] = pyglet.resource.media(str(p.relative_to(".").as_posix()), streaming=False)
+    if args.audio:
+        out, _ = (
+            ffmpeg
+            .input(p)
+            .output("-", format="s16le", acodec="pcm_s16le", ac="2", ar="44.1k")
+            .overwrite_output()
+            .run(capture_stdout=True)
+        )
+        media_np[str(p.relative_to(Path("./media")).with_suffix(""))] = np.frombuffer(out, np.int16).reshape([-1, 2])
 
 music = pyglet.media.load(music_path, streaming=False)
+music_np = np.array([], np.float16)
+if args.audio:
+    out, _ = (
+        ffmpeg
+        .input(music_path)
+        .output("-", format="s16le", acodec="pcm_s16le", ac="2", ar="44.1k")
+        .overwrite_output()
+        .run(capture_stdout=True)
+    )
+    music_np = np.frombuffer(out, np.int16).reshape([-1, 2])
+
 music_player = pyglet.media.Player()
 music_player.volume = 0.5
 music_player.queue(music)
 
-judge_line_y = 150
+judge_line_y = 160
 end_y = 720
 judge_line_imaginary_y = 1 / ((1 / judge_line_y) + (1 / (end_y - 0)) * (-0.95))
 end_imaginary_y = 1 / ((1 / end_y) + (1 / end_y - 0) * (-0.95))
 
-y_multiplier = 10.8 * 1000
+y_multiplier = 10.8 * 750
 judge_line_offset_s = judge_line_imaginary_y / y_multiplier
 
 note_vertex_source = """#version 150 core
@@ -428,9 +462,8 @@ note_vertex_source = """#version 150 core
     float calc_note_position;
     vec4 calc_position = vec4(0.0);
     float skew_multiplier = 0.0;
-    mat4 m_scale = mat4(1.0);
-    mat4 m_translate = mat4(1.0);
-    mat4 m_skew = mat4(1.0);
+    mat4 m_transform_1 = mat4(1.0);
+    mat4 m_transform_2 = mat4(1.0);
 
     uniform float judge_line_imaginary_y;
     uniform float end_y;
@@ -441,30 +474,35 @@ note_vertex_source = """#version 150 core
     {
         calc_note_position = note_position.y - offset_y;
 
-        m_scale[0][0] = scale.x;
-        m_scale[1][1] = scale.y;
-        m_translate[3][0] = note_position.x - 640;
-        m_translate[3][1] = calc_note_position;
+        m_transform_1[0][0] = scale.x;
+        m_transform_1[1][1] = scale.y;
+        m_transform_1[3][0] = note_position.x - 1 / window.projection[0][0];
+        m_transform_1[3][1] = calc_note_position;
 
-        calc_position = m_translate * m_scale * vec4(position, 1.0);
-
+        calc_position = m_transform_1 * vec4(position, 1.0);
         skew_multiplier = judge_line_imaginary_y <= calc_note_position && calc_note_position <= end_imaginary_y ? (1.0 + (-0.95 / (((end_y - 0) / calc_position.y) + 0.95))) : 0.0;
 
-        m_skew[0][0] = skew_multiplier;
-        m_skew[1][1] = skew_multiplier;
-        calc_position = m_skew * calc_position;
-        calc_position.x += 640;
-        gl_Position = window.projection * window.view * calc_position;
+        m_transform_2[0][0] = skew_multiplier;
+        m_transform_2[1][1] = skew_multiplier;
+        m_transform_2[3][0] = 1 / window.projection[0][0];
+
+        gl_Position = window.projection * window.view * m_transform_2 * calc_position;
 
         vertex_colors = colors;
         texture_coords = tex_coords;
     }
 """
 
-hold_vertex_source = """#version 150 core
+mid_vertex_source = """#version 150 core
     in vec4 colors;
     in vec3 tex_coords;
+    in vec2 scale;
     in vec3 position;
+    in vec2 note_position;
+    in vec2 last_hold_position;
+    in vec2 this_hold_position;
+    in float hold_ease_outer_pow;
+    in float hold_ease_inner_pow;
 
     out vec4 vertex_colors;
     out vec3 texture_coords;
@@ -477,23 +515,81 @@ hold_vertex_source = """#version 150 core
 
     float calc_note_position;
     vec4 calc_position = vec4(0.0);
+    float x_ratio;
     float skew_multiplier = 0.0;
-    mat4 m_skew = mat4(1.0);
+    mat4 m_transform_1 = mat4(1.0);
+    mat4 m_transform_2 = mat4(1.0);
 
+    uniform float judge_line_imaginary_y;
     uniform float end_y;
+    uniform float end_imaginary_y;
     uniform float offset_y;
 
     void main()
     {
-        calc_position = vec4(position, 1.0);
-        calc_position -= vec4(640, offset_y, 0, 0);
+        calc_note_position = note_position.y - offset_y;
+        x_ratio = pow(1 - pow(1 - (note_position.y - last_hold_position.y) / (this_hold_position.y - last_hold_position.y), hold_ease_inner_pow), hold_ease_outer_pow);
 
-        skew_multiplier = (1.0 + (-0.95 / (((end_y - 0) / calc_position[1]) + 0.95)));
-        m_skew[0][0] = skew_multiplier;
-        m_skew[1][1] = skew_multiplier;
-        calc_position = m_skew * calc_position;
-        calc_position += vec4(640, 0, 0, 0);
-        gl_Position = window.projection * window.view * calc_position;
+        m_transform_1[0][0] = scale.x;
+        m_transform_1[1][1] = scale.y;
+        m_transform_1[3][0] = mix(last_hold_position.x, this_hold_position.x, x_ratio) - 1 / window.projection[0][0];
+        m_transform_1[3][1] = calc_note_position;
+
+        calc_position = m_transform_1 * vec4(position, 1.0);
+        skew_multiplier = judge_line_imaginary_y <= calc_note_position && calc_note_position <= end_imaginary_y ? (1.0 + (-0.95 / (((end_y - 0) / calc_note_position) + 0.95))) : 0.0;
+
+        m_transform_2[0][0] = skew_multiplier;
+        m_transform_2[1][1] = skew_multiplier;
+        m_transform_2[3][0] = 1 / window.projection[0][0];
+
+        gl_Position = window.projection * window.view * m_transform_2 * calc_position;
+
+        vertex_colors = colors;
+        texture_coords = tex_coords;
+    }
+"""
+
+hold_vertex_source = """#version 150 core
+    in vec4 colors;
+    in vec3 tex_coords;
+    in float ratio_y;
+    in vec2 last_hold_position;
+    in vec2 this_hold_position;
+    in float hold_ease_outer_pow;
+    in float hold_ease_inner_pow;
+
+    out vec4 vertex_colors;
+    out vec3 texture_coords;
+
+    uniform WindowBlock
+    {
+        mat4 projection;
+        mat4 view;
+    } window;
+
+    float calc_note_position;
+    vec4 calc_position = vec4(0.0);
+    float x_ratio;
+    float skew_multiplier = 0.0;
+    mat4 m_transform = mat4(1.0);
+
+    uniform float judge_line_imaginary_y;
+    uniform float end_y;
+    uniform float end_imaginary_y;
+    uniform float offset_y;
+
+    void main()
+    {
+        calc_position = vec4(-1 / window.projection[0][0], clamp(mix(last_hold_position.y, this_hold_position.y, ratio_y) - offset_y, judge_line_imaginary_y, end_imaginary_y), 0.0, 1.0);
+        calc_position.x += mix(last_hold_position.x, this_hold_position.x, pow(1 - pow(1 - (calc_position.y + offset_y - last_hold_position.y) / (this_hold_position.y - last_hold_position.y), hold_ease_inner_pow), hold_ease_outer_pow));
+        
+        skew_multiplier = (1.0 + (-0.95 / (((end_y - 0) / calc_position.y) + 0.95)));
+
+        m_transform[0][0] = skew_multiplier;
+        m_transform[1][1] = skew_multiplier;
+        m_transform[3][0] = 1 / window.projection[0][0];
+        
+        gl_Position = window.projection * window.view * m_transform * calc_position;
 
         vertex_colors = colors;
         texture_coords = tex_coords;
@@ -520,9 +616,8 @@ flick_vertex_source = """#version 150 core
     float calc_note_position;
     vec4 calc_position = vec4(0.0);
     float skew_multiplier = 0.0;
-    mat4 m_scale = mat4(1.0);
-    mat4 m_translate = mat4(1.0);
-    mat4 m_skew = mat4(1.0);
+    mat4 m_transform_1 = mat4(1.0);
+    mat4 m_transform_2 = mat4(1.0);
 
     uniform float judge_line_imaginary_y;
     uniform float end_y;
@@ -535,21 +630,20 @@ flick_vertex_source = """#version 150 core
     {
         calc_note_position = note_position.y - offset_y;
 
-        m_scale[0][0] = scale.x;
-        m_scale[1][1] = scale.y;
-        m_translate[3][0] = note_position.x + (x_offset_multiplier * flick_offset) - 640;
-        m_translate[3][1] = flick_offset;
+        m_transform_1[0][0] = scale.x;
+        m_transform_1[1][1] = scale.y;
+        m_transform_1[3][0] = note_position.x + (x_offset_multiplier * flick_offset) - 1 / window.projection[0][0];
+        m_transform_1[3][1] = flick_offset;
 
-        calc_position = m_translate * m_scale * vec4(position, 1.0);
-
+        calc_position = m_transform_1 * vec4(position, 1.0);
         skew_multiplier = judge_line_imaginary_y <= calc_note_position && calc_note_position <= end_imaginary_y ? (1.0 + (-0.95 / (((end_y - 0) / calc_note_position) + 0.95))) : 0.0;
 
-        m_skew[0][0] = skew_multiplier;
-        m_skew[1][1] = skew_multiplier;
-        calc_position = m_skew * calc_position;
-        calc_position.x += 640;
-        calc_position.y += calc_note_position * skew_multiplier;
-        gl_Position = window.projection * window.view * calc_position;
+        m_transform_2[0][0] = skew_multiplier;
+        m_transform_2[1][1] = skew_multiplier;
+        m_transform_2[3][0] = 1 / window.projection[0][0];
+        m_transform_2[3][1] = calc_note_position * skew_multiplier;
+        
+        gl_Position = window.projection * window.view * m_transform_2 * calc_position;
 
         vertex_colors = colors * vec4(1, 1, 1, pow(1 - (flick_offset / max_flick_offset), 2.0));
         texture_coords = tex_coords;
@@ -583,10 +677,12 @@ fragment_array_source = """#version 150 core
 """
 
 note_vertex_shader = Shader(note_vertex_source, "vertex")
+mid_vertex_shader = Shader(mid_vertex_source, "vertex")
 hold_vertex_shader = Shader(hold_vertex_source, "vertex")
 flick_vertex_shader = Shader(flick_vertex_source, "vertex")
 fragment_shader = Shader(fragment_source, "fragment")
 note_program = ShaderProgram(note_vertex_shader, fragment_shader)
+mid_program = ShaderProgram(mid_vertex_shader, fragment_shader)
 hold_program = ShaderProgram(hold_vertex_shader, fragment_shader)
 flick_program = ShaderProgram(flick_vertex_shader, fragment_shader)
 
@@ -595,10 +691,15 @@ with note_program:
     note_program["end_y"] = end_y
     note_program["end_imaginary_y"] = end_imaginary_y
 
+with mid_program:
+    mid_program["judge_line_imaginary_y"] = judge_line_imaginary_y
+    mid_program["end_y"] = end_y
+    mid_program["end_imaginary_y"] = end_imaginary_y
+
 with hold_program:
-    # hold_program["judge_line_imaginary_y"] = judge_line_imaginary_y
+    hold_program["judge_line_imaginary_y"] = judge_line_imaginary_y
     hold_program["end_y"] = end_y
-    # hold_program["end_imaginary_y"] = end_imaginary_y
+    hold_program["end_imaginary_y"] = end_imaginary_y
 
 with flick_program:
     flick_program["judge_line_imaginary_y"] = judge_line_imaginary_y
@@ -608,23 +709,31 @@ with flick_program:
 
 activated = set()
 batch = pyglet.graphics.Batch()
-bg_sprites = []
 bg_group = pyglet.graphics.Group(0)
-hold_sprites = []
-hold_group = pyglet.graphics.Group(1)
-note_sprites = []
-note_group = pyglet.graphics.Group(2)
-flick_sprites = []
-flick_group = pyglet.graphics.Group(3)
-fg_sprites = []
-fg_group = pyglet.graphics.Group(4)
+judge_line_overlay_group = pyglet.graphics.Group(1)
+hold_group = pyglet.graphics.Group(2)
+note_group = pyglet.graphics.Group(3)
+flick_group = pyglet.graphics.Group(4)
+hold_judge_line_group = pyglet.graphics.Group(5)
+fg_group = pyglet.graphics.Group(6)
+
+sprite_lists = {
+    "bg_sprites": [],
+    "judge_line_overlay_sprites": [],
+    "hold_sprites": [],
+    "note_sprites": [],
+    "flick_sprites": [],
+    "hold_judge_line_sprites": [],
+    "fg_sprites": [],
+}
 
 flick_offset = 0
 
 NOTES_TEX = ["notes_normal", "notes_crtcl", "notes_long", "notes_flick"]
 
+note_atlas = pyglet.image.atlas.TextureAtlas(512, 1024)
 notes_textures = {
-    name: textures[name]
+    name: note_atlas.add(textures[name].get_image_data(), 2)
     for name in NOTES_TEX
 }
 
@@ -651,8 +760,9 @@ notes_coords = {
 
 HOLD_TEX = ["tex_hold_path", "tex_hold_path_crtcl"]
 
+hold_atlas = pyglet.image.atlas.TextureAtlas(512, 128)
 hold_textures = {
-    name: textures[name].get_region(32, 1, 448 - 64, 30)
+    name: hold_atlas.add(textures[name].get_image_data(), 2).get_region(32, 1, 448 - 64, 30)
     for name in HOLD_TEX
 }
 
@@ -690,7 +800,7 @@ for i in range(1, 7):
 flick_arrow_textures.update(flick_arrow_diagonal_textures)
 
 def activate_note(data, y):
-    if pause:
+    if args.video or pause:
         return
     if y > judge_line_imaginary_y + offset_y * y_multiplier:
         return
@@ -706,54 +816,79 @@ def activate_note(data, y):
         sound.append("critical")
 
     sound = "se_live_" + ("_".join(sound) if sound else "perfect")
-        
+
     player = media[sound].play()
     player.volume = 0.5
     activated.add(data[:-1])
 
-def draw_note_texture(texture, tex_coords, x, y, width = 0, height = 0, sprite_list = None):
-    if sprite_list is None:
-        sprite_list = note_sprites
-    sprite_list.append(
-        note_program.vertex_list_indexed(
-            12,
-            pyglet.gl.GL_TRIANGLES,
-            [0, 1, 6, 0, 6, 7, 1, 2, 5, 1, 5, 6, 2, 3, 4, 2, 4, 5],
-            batch=batch,
-            group=pyglet.sprite.AdvancedSprite.group_class(
-                texture,
-                pyglet.gl.GL_SRC_ALPHA,
-                pyglet.gl.GL_ONE_MINUS_SRC_ALPHA,
-                note_program, 
-                note_group
-            ),
-            position=(
-                "f", 
-                (
-                    -53, -height, 0,
-                    -53 + 82, -height, 0,
-                    width + 53 - 82, -height, 0,
-                    width + 53, -height, 0,
+note_keys = set()
+note_index = defaultdict(lambda: 0)
+note_indices = defaultdict(list)
+note_position = defaultdict(list)
+note_note_position = defaultdict(list)
+note_tex_coords = defaultdict(list)
+def draw_note_texture(tex_coords, x, y, width = 0, height = 0, key = None):
+    if key is None:
+        key = "note_sprites"
+    note_keys.add(key)
+    last_note_index = note_index[key]
+    note_index[key] += 8
+    note_indices[key].extend(last_note_index + i for i in [0, 1, 6, 0, 6, 7, 1, 2, 5, 1, 5, 6, 2, 3, 4, 2, 4, 5])
+    note_position[key].extend((
+        -53, -height, 0,
+        -53 + 82, -height, 0,
+        width + 53 - 82, -height, 0,
+        width + 53, -height, 0,
 
-                    width + 53, height, 0,
-                    width + 53 - 82, height, 0,
-                    -53 + 82, height, 0,
-                    -53, height, 0,
-                )
-            ),
-            colors=("Bn", (255, 255, 255, 255) * 8),
-            scale=("f", (1.0, 0.5) * 8),
-            note_position=("f", (x, y) * 8),
-            tex_coords=("f", tex_coords)
+        width + 53, height, 0,
+        width + 53 - 82, height, 0,
+        -53 + 82, height, 0,
+        -53, height, 0,
+    ))
+    note_note_position[key].extend((x, y) * 8)
+    note_tex_coords[key].extend(tex_coords)
+
+def commit_draw_note_texture():
+    global note_keys
+    global note_index
+    global note_indices
+    global note_position
+    global note_note_position
+    global note_tex_coords
+    for key in note_keys:
+        sprite_lists[key].append(
+            note_program.vertex_list_indexed(
+                note_index[key],
+                pyglet.gl.GL_TRIANGLES,
+                note_indices[key],
+                batch=batch,
+                group=pyglet.sprite.AdvancedSprite.group_class(
+                    note_atlas.texture,
+                    pyglet.gl.GL_SRC_ALPHA,
+                    pyglet.gl.GL_ONE_MINUS_SRC_ALPHA,
+                    note_program, 
+                    note_group
+                ),
+                position=("f", tuple(note_position[key])),
+                colors=("Bn", (255, 255, 255, 255) * note_index[key]),
+                scale=("f", (1.0, 0.5) * note_index[key]),
+                note_position=("f", tuple(note_note_position[key])),
+                tex_coords=("f", tuple(note_tex_coords[key]))
+            )
         )
-    )
+    note_keys = set()
+    note_index = defaultdict(lambda: 0)
+    note_indices = defaultdict(list)
+    note_position = defaultdict(list)
+    note_note_position = defaultdict(list)
+    note_tex_coords = defaultdict(list)
 
-def draw_mid_texture(texture, x, y):
-    width = texture.width // 2
-    height = texture.height // 2
-    hold_sprites.append(
-        note_program.vertex_list_indexed(
-            12,
+def draw_flick_texture(texture, x, y, reverse, x_offset_mul, sprite_list = None):
+    if sprite_list is None:
+        sprite_list = sprite_lists["flick_sprites"]
+    sprite_list.append(
+        flick_program.vertex_list_indexed(
+            4,
             pyglet.gl.GL_TRIANGLES,
             [0, 1, 2, 0, 2, 3],
             batch=batch,
@@ -761,7 +896,40 @@ def draw_mid_texture(texture, x, y):
                 texture,
                 pyglet.gl.GL_SRC_ALPHA,
                 pyglet.gl.GL_ONE_MINUS_SRC_ALPHA,
-                note_program, 
+                flick_program, 
+                flick_group
+            ),
+            position=(
+                "f", 
+                (
+                    -texture.anchor_x, 0, 0,
+                    texture.width - texture.anchor_x, 0, 0,
+                    texture.width - texture.anchor_x, texture.height, 0,
+                    -texture.anchor_x, texture.height, 0,
+                )
+            ),
+            colors=("Bn", (255, 255, 255, 255) * 4),
+            scale=("f", (-1.0 if reverse else 1.0, 1.0) * 4),
+            note_position=("f", (x, y) * 4),
+            x_offset_multiplier=("f", (x_offset_mul,) * 4),
+            tex_coords=("f", texture.tex_coords)
+        )
+    )
+
+def draw_mid_texture(texture, y, last_hold_position, this_hold_position, ease):
+    width = texture.width // 2
+    height = texture.height // 2
+    sprite_lists["note_sprites"].append(
+        mid_program.vertex_list_indexed(
+            4,
+            pyglet.gl.GL_TRIANGLES,
+            [0, 1, 2, 0, 2, 3],
+            batch=batch,
+            group=pyglet.sprite.AdvancedSprite.group_class(
+                texture,
+                pyglet.gl.GL_SRC_ALPHA,
+                pyglet.gl.GL_ONE_MINUS_SRC_ALPHA,
+                mid_program, 
                 note_group
             ),
             position=(
@@ -775,10 +943,84 @@ def draw_mid_texture(texture, x, y):
             ),
             colors=("Bn", (255, 255, 255, 255) * 4),
             scale=("f", (0.5, 0.5) * 4),
-            note_position=("f", (x, y) * 4),
+            note_position=("f", (0, y) * 4),
+            last_hold_position=("f", last_hold_position * 4),
+            this_hold_position=("f", this_hold_position * 4),
+            hold_ease_outer_pow=("f", (2.0 if "hold_ease_in" in ease else 1.0,) * 4),
+            hold_ease_inner_pow=("f", (2.0 if "hold_ease_out" in ease else 1.0,) * 4),
             tex_coords=("f", texture.tex_coords)
         )
     )
+
+hold_index = 0
+hold_indices = []
+hold_ratio_y = []
+hold_last_hold_position = []
+hold_this_hold_position = []
+hold_hold_ease_outer_pow = []
+hold_hold_ease_inner_pow = []
+hold_tex_coords = []
+def draw_hold_texture(hold_texture, last_hold_position, this_hold_position, portion, ease):
+    global hold_index
+    last_hold_index = hold_index
+    hold_index += portion * 4
+    hold_indices.extend(last_hold_index + e for i in range(0, portion * 4, 4) for e in (i, i+1, i+2, i, i+2, i+3))
+    hold_ratio_y.extend(e for i in range(portion) for e in (i / portion, i / portion, (i + 1) / portion, (i + 1) / portion))
+    hold_last_hold_position.extend((
+        last_hold_position[0], last_hold_position[2],
+        last_hold_position[1], last_hold_position[2],
+        last_hold_position[1], last_hold_position[2],
+        last_hold_position[0], last_hold_position[2],
+    ) * portion)
+    hold_this_hold_position.extend((
+        this_hold_position[0], this_hold_position[2],
+        this_hold_position[1], this_hold_position[2],
+        this_hold_position[1], this_hold_position[2],
+        this_hold_position[0], this_hold_position[2],
+    ) * portion)
+    hold_hold_ease_outer_pow.extend((2.0 if "hold_ease_in" in ease else 1.0,) * 4 * portion)
+    hold_hold_ease_inner_pow.extend((2.0 if "hold_ease_out" in ease else 1.0,) * 4 * portion)
+    hold_tex_coords.extend(hold_texture.tex_coords * portion)
+
+def commit_draw_hold_texture():
+    global hold_index
+    global hold_indices
+    global hold_ratio_y
+    global hold_last_hold_position
+    global hold_this_hold_position
+    global hold_hold_ease_outer_pow
+    global hold_hold_ease_inner_pow
+    global hold_tex_coords
+    sprite_lists["hold_sprites"].append(
+        hold_program.vertex_list_indexed(
+            hold_index,
+            pyglet.gl.GL_TRIANGLES,
+            hold_indices,
+            batch=batch,
+            group=pyglet.sprite.AdvancedSprite.group_class(
+                hold_atlas.texture,
+                pyglet.gl.GL_SRC_ALPHA,
+                pyglet.gl.GL_ONE_MINUS_SRC_ALPHA,
+                hold_program, 
+                hold_group
+            ),
+            ratio_y=("f", tuple(hold_ratio_y)),
+            last_hold_position=("f", tuple(hold_last_hold_position)),
+            this_hold_position=("f", tuple(hold_this_hold_position)),
+            hold_ease_outer_pow=("f", tuple(hold_hold_ease_outer_pow)),
+            hold_ease_inner_pow=("f", tuple(hold_hold_ease_inner_pow)),
+            colors=("Bn", (255, 255, 255, 255) * hold_index),
+            tex_coords=("f", tuple(hold_tex_coords)),
+        )
+    )
+    hold_index = 0
+    hold_indices = []
+    hold_ratio_y = []
+    hold_last_hold_position = []
+    hold_this_hold_position = []
+    hold_hold_ease_outer_pow = []
+    hold_hold_ease_inner_pow = []
+    hold_tex_coords = []
 
 def draw_flick(data, y, x = None, width = None, sprite_list = None):
     flick_texture = None
@@ -813,43 +1055,11 @@ def draw_flick(data, y, x = None, width = None, sprite_list = None):
         x = (1280 / 12) * data[-3]
     if width is None:
         width = (1280 / 12) * data[-2]
-    if sprite_list is None:
-        sprite_list = flick_sprites
 
     if flick_texture:
-        flick_width = flick_texture.width
-        flick_height = flick_texture.height
-        sprite_list.append(
-            flick_program.vertex_list_indexed(
-                4,
-                pyglet.gl.GL_TRIANGLES,
-                [0, 1, 2, 0, 2, 3],
-                batch=batch,
-                group=pyglet.sprite.AdvancedSprite.group_class(
-                    flick_texture,
-                    pyglet.gl.GL_SRC_ALPHA,
-                    pyglet.gl.GL_ONE_MINUS_SRC_ALPHA,
-                    flick_program, 
-                    flick_group
-                ),
-                position=(
-                    "f", 
-                    (
-                        -flick_texture.anchor_x, 0, 0,
-                        flick_width - flick_texture.anchor_x, 0, 0,
-                        flick_width - flick_texture.anchor_x, flick_height, 0,
-                        -flick_texture.anchor_x, flick_height, 0,
-                    )
-                ),
-                colors=("Bn", (255, 255, 255, 255) * 4),
-                scale=("f", (-1.0 if reverse else 1.0, 1.0) * 4),
-                note_position=("f", (x + width / 2, y) * 4),
-                x_offset_multiplier=("f", (x_offset_mul,) * 4),
-                tex_coords=("f", flick_texture.tex_coords)
-            )
-        )
+        draw_flick_texture(flick_texture, x + width / 2, y, reverse, x_offset_mul, sprite_list)
 
-def draw_note(data, y, x = None, width = None, sprite_list = None):
+def draw_note(data, y, x = None, width = None, key = None):
     if "critical" in data[-1]:
         texture = "notes_crtcl"
     elif data[-1].intersection({"flick_up", "flick_upleft", "flick_upright"}):
@@ -862,194 +1072,167 @@ def draw_note(data, y, x = None, width = None, sprite_list = None):
         x = (1280 / 12) * data[-3]
     if width is None:
         width = (1280 / 12) * data[-2]
-    draw_note_texture(notes_textures[texture], notes_coords[texture], x, y, width, notes_textures[texture].height, sprite_list)
-    draw_flick(data, y, x, width, sprite_list)
+    draw_note_texture(notes_coords[texture], x, y, width, notes_textures[texture].height, key)
+    draw_flick(data, y, x, width, sprite_lists[key] if key else None)
 
-def draw_hold_texture(hold_texture, indices, positions):
-    count = len(positions) // 3
-    hold_sprites.append(
-        hold_program.vertex_list_indexed(
-            count,
-            pyglet.gl.GL_TRIANGLES,
-            indices,
-            batch=batch,
-            group=pyglet.sprite.AdvancedSprite.group_class(
-                hold_texture,
-                pyglet.gl.GL_SRC_ALPHA,
-                pyglet.gl.GL_ONE_MINUS_SRC_ALPHA,
-                hold_program, 
-                hold_group
-            ),
-            position=(
-                "f", 
-                tuple(positions)
-            ),
-            colors=("Bn", (255, 255, 255, 255) * count),
-            tex_coords=("f", hold_texture.tex_coords * (count // 4))
-        )
-    )
-
-def draw_hold(hold_data, y):
+def draw_mids(hold_data):
     last_data = hold_data[0]
     mids = []
-    index = 0
-    indices = []
-    positions = []
-    hold_texture_str = None
-    hold_texture = None
     for data in hold_data[1:]:
         if "hold_visible" in data[2][-1]:
             mids.append(data)
         if "hold_ignore" in data[2][-1]:
             continue
         if "critical" in last_data[2][-1]:
-            new_hold_texture_str = "tex_hold_path_crtcl"
-            mid_texture = "notes_long_among_crtcl"
+            mid_texture = textures["notes_long_among_crtcl"]
         else:
-            new_hold_texture_str = "tex_hold_path"
-            mid_texture = "notes_long_among"
-        if indices and positions and (new_hold_texture_str != hold_texture_str):
-            draw_hold_texture(hold_texture, indices, positions)
-            index = 0
-            indices = []
-            positions = []
-        hold_texture_str = new_hold_texture_str
-        hold_texture = hold_textures[new_hold_texture_str]
-        mid_texture = textures[mid_texture]
-        last_y = (last_data[1] - hold_data[0][1]) * y_multiplier + y
-        this_y = (data[1] - hold_data[0][1]) * y_multiplier + y
-        if this_y - offset_y * y_multiplier < judge_line_imaginary_y:
-            last_data = data
+            mid_texture = textures["notes_long_among"]
+        last_y = last_data[1] * y_multiplier
+        this_y = data[1] * y_multiplier
+        last_x_l = (1280 / 12) * last_data[2][-3]
+        last_x_r = last_x_l + (1280 / 12) * last_data[2][-2]
+        this_x_l = (1280 / 12) * data[2][-3]
+        this_x_r = this_x_l + (1280 / 12) * data[2][-2]
+        while mids:
+            mid = mids.pop()
+            mid_begin, mid_real_y, mid_data = mid
+            mid_data = (mid_begin, *mid_data)
+            mid_y = mid_real_y * y_multiplier
+            draw_mid_texture(mid_texture, mid_y, ((last_x_l + last_x_r) / 2, last_y), ((this_x_l + this_x_r) /2, this_y), last_data[2][-1])
+        last_data = data
+
+def draw_hold(hold_data):
+    last_data = hold_data[0]
+    for data in hold_data[1:]:
+        if "hold_ignore" in data[2][-1]:
             continue
-        elif last_y - offset_y * y_multiplier > end_imaginary_y:
-            break
+        if "critical" in last_data[2][-1]:
+            hold_texture = hold_textures["tex_hold_path_crtcl"]
+        else:
+            hold_texture = hold_textures["tex_hold_path"]
+        last_y = last_data[1] * y_multiplier
+        this_y = data[1] * y_multiplier
         last_x_l = (1280 / 12) * last_data[2][-3]
         last_x_r = last_x_l + (1280 / 12) * last_data[2][-2]
         this_x_l = (1280 / 12) * data[2][-3]
         this_x_r = this_x_l + (1280 / 12) * data[2][-2]
         ease_in = "hold_ease_in" in last_data[2][-1]
         ease_out = "hold_ease_out" in last_data[2][-1]
-        if last_y < judge_line_imaginary_y + offset_y * y_multiplier:
-            y_ratio = (judge_line_imaginary_y + offset_y * y_multiplier - last_y) / (this_y - last_y)
-            if ease_in:
-                y_ratio = y_ratio ** 2
-            elif ease_out:
-                y_ratio = 1 - ((1 - y_ratio) ** 2)
-            last_x_l = (this_x_l - last_x_l) * y_ratio + last_x_l
-            last_x_r = (this_x_r - last_x_r) * y_ratio + last_x_r
-            last_y = judge_line_imaginary_y + offset_y * y_multiplier
-        if this_y > end_imaginary_y + offset_y * y_multiplier:
-            y_ratio = (end_imaginary_y + offset_y * y_multiplier - last_y) / (this_y - last_y)
-            if ease_in:
-                y_ratio = y_ratio ** 2
-            elif ease_out:
-                y_ratio = 1 - ((1 - y_ratio) ** 2)
-            this_x_l = (this_x_l - last_x_l) * y_ratio + last_x_l
-            this_x_r = (this_x_r - last_x_r) * y_ratio + last_x_r
-            this_y = end_imaginary_y + offset_y * y_multiplier
-        last_real_y = (1 + (-0.95 / ((600 / (last_y - offset_y * y_multiplier)) + 0.95))) * (last_y - offset_y * y_multiplier)
-        this_real_y = (1 + (-0.95 / ((600 / (this_y - offset_y * y_multiplier)) + 0.95))) * (this_y - offset_y * y_multiplier)
-        portion = max(round((this_real_y - last_real_y) / (end_y - judge_line_y) * 32), 8) if ease_in or ease_out else 1
-        ratios = [i / portion for i in range(portion + 1)]
-        if ease_in:
-            x_ratios = [ratio**2 for ratio in ratios]
-        elif ease_out:
-            x_ratios = [1 - ((1 - ratio) ** 2) for ratio in ratios]
-        else:
-            x_ratios = ratios
-        d_y = this_y - last_y
-        portion_y = [d_y * ratio + last_y for ratio in ratios]
-        d_x_l = this_x_l - last_x_l
-        portion_x_l = [d_x_l * ratio + last_x_l for ratio in x_ratios]
-        d_x_r = this_x_r - last_x_r
-        portion_x_r = [d_x_r * ratio + last_x_r for ratio in x_ratios]
-        portion_data = [*zip(portion_x_l, portion_x_r, portion_y)]
-        for last_portion, this_portion in zip(portion_data[:-1], portion_data[1:]):
-            last_l_index = index
-            index += 1
-            positions.extend((last_portion[0], last_portion[2], 0))
-            last_r_index = index
-            index += 1
-            positions.extend((last_portion[1], last_portion[2], 0))
-            this_r_index = index
-            index += 1
-            positions.extend((this_portion[1], this_portion[2], 0))
-            this_l_index = index
-            index += 1
-            positions.extend((this_portion[0], this_portion[2], 0))
-            indices.extend((last_l_index, last_r_index, this_r_index, last_l_index, this_r_index, this_l_index))
-        while mids:
-            mid = mids.pop()
-            mid_begin, mid_real_y, mid_data = mid
-            mid_data = (mid_begin, *mid_data)
-            mid_y = (mid_real_y - hold_data[0][1]) * y_multiplier + y
-            activate_note(mid_data, mid_y)
-            if mid_y > end_imaginary_y + offset_y * y_multiplier:
-                continue
-            mid_ratio = (mid_y - last_y) / (this_y - last_y)
-            if "hold_ease_in" in last_data[2][-1]:
-                mid_ratio = mid_ratio ** 2
-            elif "hold_ease_out" in last_data[2][-1]:
-                mid_ratio = 1 - ((1 - mid_ratio) ** 2)
-            mid_x_l = int(((this_x_l - last_x_l) * mid_ratio) + last_x_l)
-            mid_x_r = int(((this_x_r - last_x_r) * mid_ratio) + last_x_r)
-            draw_mid_texture(mid_texture, (mid_x_l + mid_x_r) // 2, mid_y)
-        if portion_data[0][-1] == judge_line_imaginary_y + offset_y * y_multiplier:
-            draw_note(hold_data[0][2], judge_line_imaginary_y + offset_y * y_multiplier + 1, portion_data[0][0], portion_data[0][1] - portion_data[0][0], sprite_list=hold_sprites)
+        portion = max(math.ceil((this_y - last_y) / 200), 8) if ease_in or ease_out else 1
+        draw_hold_texture(hold_texture, (last_x_l, last_x_r, last_y), (this_x_l, this_x_r, this_y), portion, last_data[2][-1])
         last_data = data
-    if indices and positions:
-        draw_hold_texture(hold_texture, indices, positions)
+
+def draw_hold_judge_line(hold_data):
+    last_data = hold_data[0]
+    for data in hold_data[1:]:
+        if "hold_ignore" in data[2][-1]:
+            continue
+        last_y = last_data[1] * y_multiplier
+        this_y = data[1] * y_multiplier
+        if last_y < judge_line_imaginary_y + offset_y * y_multiplier < this_y:
+            last_clamp_y = judge_line_imaginary_y + offset_y * y_multiplier
+            ratio = (last_clamp_y - last_y) / (this_y - last_y)
+            last_x_l = (1280 / 12) * last_data[2][-3]
+            last_x_r = last_x_l + (1280 / 12) * last_data[2][-2]
+            this_x_l = (1280 / 12) * data[2][-3]
+            this_x_r = this_x_l + (1280 / 12) * data[2][-2]
+            ease_in = "hold_ease_in" in last_data[2][-1]
+            ease_out = "hold_ease_out" in last_data[2][-1]
+            if ease_in:
+                x_ratio = ratio ** 2
+            elif ease_out:
+                x_ratio = 1 - ((1 - ratio) ** 2)
+            else:
+                x_ratio = ratio
+            x_l = last_x_l + (this_x_l - last_x_l) * x_ratio
+            x_r = last_x_r + (this_x_r - last_x_r) * x_ratio
+            draw_note(hold_data[0][2], judge_line_imaginary_y + offset_y * y_multiplier + 1, x_l, x_r - x_l, key="hold_judge_line_sprites")
+            return
+        last_data = data
 
 def draw_bg():
-    if not bg_sprites:
+    if not sprite_lists["bg_sprites"]:
         sx, sy = aspect(textures["bg_default"], (1280, 720))
         sprite = pyglet.sprite.Sprite(textures["bg_default"], 640 - sx // 2, 360 - sy // 2, batch=batch, group=bg_group)
         sprite.scale_x = sx / textures["bg_default"].width
         sprite.scale_y = sy / textures["bg_default"].height
-        bg_sprites.append(sprite)
+        sprite_lists["bg_sprites"].append(sprite)
         sx, sy = aspect(textures["lane_base"], (1280, 960))
         sprite = pyglet.sprite.Sprite(textures["lane_base"], 640 - sx // 2, 360 - sy // 2, batch=batch, group=bg_group)
         sprite.scale_x = sx / textures["lane_base"].width
         sprite.scale_y = sy / textures["lane_base"].height
-        bg_sprites.append(sprite)
+        sprite_lists["bg_sprites"].append(sprite)
         sx, sy = aspect(textures["lane_line"], (1280, 960))
         sprite = pyglet.sprite.Sprite(textures["lane_line"], 640 - sx // 2, 360 - sy // 2, batch=batch, group=bg_group)
         sprite.scale_x = sx / textures["lane_line"].width
         sprite.scale_y = sy / textures["lane_line"].height
-        bg_sprites.append(sprite)
+        sprite_lists["bg_sprites"].append(sprite)
         sx, sy = aspect(textures["judge_line"], (1080, 120))
         sprite = pyglet.sprite.Sprite(textures["judge_line"], 640 - sx // 2, 150 - sy // 2, batch=batch, group=bg_group)
         sprite.scale_x = sx / textures["judge_line"].width
         sprite.scale_y = sy / textures["judge_line"].height
-        bg_sprites.append(sprite)
+        sprite_lists["bg_sprites"].append(sprite)
 
+audio = np.zeros((int((lead_time + t.end() + follow_time) * 44100), 2), np.float64)
+def activate_note_audio(data):
+    sound = []
+    if data[-1].intersection({"flick_up", "flick_upleft", "flick_upright"}):
+        sound.append("flick")
+    elif "hold_visible" in data[-1]:
+        sound.append("connect")
+
+    if "critical" in data[-1]:
+        sound.append("critical")
+
+    sound = "se_live_" + ("_".join(sound) if sound else "perfect")
+
+    audio[int((lead_time + data[0]) * 44100):int((lead_time + data[0]) * 44100) + media_np[sound].shape[0], :] += media_np[sound] * 0.5
+
+def commit_note_audio():
+    global audio
+    music_trim = music_np[int((music_offset - judge_line_offset_s) * 44100):int((music_offset - judge_line_offset_s) * 44100) + audio.shape[0] - int(lead_time * 44100), :]
+    music_max = np.max(music_trim)
+    audio[int(lead_time * 44100):int(lead_time * 44100) + music_trim.shape[0], :] += music_trim * 0.5
+    clipped_audio = (audio / music_max * np.iinfo(np.int16).max).astype(np.int16)
+    process = (
+        ffmpeg
+        .input("-", format="s16le", ac="2", ar="44.1k")
+        .output("./out/audio.wav")
+        .overwrite_output()
+        .run_async(pipe_stdin=True)
+    )
+    process.stdin.write(clipped_audio)
+    process.stdin.close()
+    process.wait()
+    
 def draw_notes():
     for e in sorted(t[:]):
         begin = e.begin
         end = e.end
         real_y, data = e.data
         match data[0]:
-            case "hispeed":
-                pass
-            case "barlength":
-                pass
-            case "bpm":
-                pass
-            case "skill":
-                pass
-            case "fever":
-                pass
             case "note":
                 match len(data[1]):
                     case 1:
                         # hold
                         hold_data = data[1][0]
+                        # mids
+                        draw_mids(hold_data)
                         # start / end
                         for begin, real_y, data in [hold_data[0], hold_data[-1]]:
                             draw_note((begin, *data), real_y * y_multiplier)
+                            if args.audio:
+                                activate_note_audio((begin, *data))
+                        draw_hold(hold_data)
                     case _:
                         # tap
                         draw_note((begin, *data[1]), real_y * y_multiplier)
+                        if args.audio:
+                            activate_note_audio((begin, *data[1]))
+    commit_draw_note_texture()
+    commit_draw_hold_texture()
+    if args.audio:
+        commit_note_audio()
 
 last_combo = 0
 last_combo_time = current_time
@@ -1062,34 +1245,22 @@ def draw_fg():
         last_combo = combo
         last_combo_time = current_time
 
-    if not fg_sprites:
-        fg_sprites.append(
-                pyglet.text.Label(
-                f"{len(hold_sprites)}|{len(note_sprites)}|{len(flick_sprites)}",
-                font_size=24,
-                bold=True,
-                color=(127, 127, 127, 127),
-                x=10,
-                y=48,
-                batch=batch,
-                group=fg_group
-            )
-        )
-        fg_sprites.append(
+    if not sprite_lists["fg_sprites"]:
+        sprite_lists["fg_sprites"].append(
             pyglet.text.Label(
                 "COMBO",
-                font_size= 20,
+                font_size= 15,
                 bold=True,
                 color=(255, 255, 255, 255),
                 x=1100,
-                y=460,
+                y=450,
                 anchor_x="center",
                 anchor_y="center",
                 batch=batch,
                 group=fg_group
             )
         )
-        fg_sprites.append(
+        sprite_lists["fg_sprites"].append(
             pyglet.text.Label(
                 f"{combo}",
                 font_size=36 + min(1.0, (current_time - last_combo_time) * 8) * 24,
@@ -1104,40 +1275,46 @@ def draw_fg():
             )
         )
     else:
-        fg_sprites[0].text = f"{len(hold_sprites)}|{len(note_sprites)}|{len(flick_sprites)}"
         if combo:
-            fg_sprites[2].text = f"{combo}"
-            fg_sprites[2].font_size = 36 + min(1.0, (current_time - last_combo_time) * 8) * 24
-            fg_sprites[1].visible = True
-            fg_sprites[2].visible = True
+            sprite_lists["fg_sprites"][1].text = f"{combo}"
+            sprite_lists["fg_sprites"][1].font_size = 36 + min(1.0, (current_time - last_combo_time) * 8) * 24
+            sprite_lists["fg_sprites"][0].visible = True
+            sprite_lists["fg_sprites"][1].visible = True
         else:
-            fg_sprites[1].visible = False
-            fg_sprites[2].visible = False
+            sprite_lists["fg_sprites"][0].visible = False
+            sprite_lists["fg_sprites"][1].visible = False
 
 draw_bg()
 draw_notes()
 draw_fg()
 
-@window.event
-def on_draw():
+for k, sprite_list in sprite_lists.items():
+    print(f"{k}: {len(sprite_list)}")
+
+def update(dt):
     gl.glEnable(gl.GL_BLEND)
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
     window.clear()
 
+    global previous_offset_time
     global offset_time
     global previous_time
     global current_time
     global flick_offset
-    current_time = time.perf_counter()
 
-    previous_offset_time = offset_time
-
-    if pause:
+    previous_time = current_time
+    current_time = current_time + dt
+    if args.video:
+        previous_offset_time = offset_time
+        offset_time += current_time - previous_time
+    elif pause:
         if keys[key.DOWN]:
             offset_time = max(-1, offset_time - 0.05)
         elif keys[key.UP]:
             offset_time += 0.05
+        previous_offset_time = math.nextafter(offset_time, -math.inf)
     else:
+        previous_offset_time = offset_time
         offset_time += current_time - previous_time
 
     flick_offset += (current_time - previous_time) * 256
@@ -1145,7 +1322,7 @@ def on_draw():
         flick_offset -= 128
 
     global music_player
-    if not music_player.playing and not pause and music_offset + offset_time + judge_line_offset_s > 0:
+    if not music_player.playing and music_offset + offset_time + judge_line_offset_s > 0 and not pause:
         music_player.seek(music_offset + offset_time + judge_line_offset_s)
         music_player.play()
 
@@ -1163,17 +1340,11 @@ def on_draw():
     else:
         base_offset_end_y, offset_end_time, end_speed = inverse_y_lookup[bisect.bisect_right(inverse_y_lookup, offset_end_y, key=lambda e: e[0]) - 1]
         offset_end_time += (offset_end_y - base_offset_end_y) / end_speed
-
-    global bg_sprites
-    global hold_sprites
-    global note_sprites
-    global flick_sprites
-    global fg_sprites
     
-    for e in hold_sprites:
+    for e in sprite_lists["hold_judge_line_sprites"]:
         e.delete()
         del e
-    hold_sprites = []
+    sprite_lists["hold_judge_line_sprites"] = []
 
     draw_bg()
 
@@ -1187,29 +1358,54 @@ def on_draw():
                     case 1:
                         # hold
                         hold_data = data[1][0]
-                        # start / end
-                        for begin, real_y, data in [hold_data[0], hold_data[-1]]:
-                            activate_note((begin, *data), real_y * y_multiplier)
+                        # start / end / mids
+                        for begin, real_y, data in hold_data:
+                            if "hold_invisible" not in data[-1]:
+                                activate_note((begin, *data), real_y * y_multiplier)
+                        # hold judge line
+                        draw_hold_judge_line(hold_data)
                     case _:
-                        activate_note((begin, *data[1]), real_y * y_multiplier)
+                        activate_note((begin, *data[1]), real_y * y_multiplier)    
 
-    for e in sorted(t[offset_time:offset_end_time]):
-        begin = e.begin
-        end = e.end
-        real_y, data = e.data
-        match data[0]:
-            case "note":
-                match len(data[1]):
-                    case 1:
-                        # hold
-                        hold_data = data[1][0]
-                        # hold path
-                        draw_hold(hold_data, real_y * y_multiplier)
-
+    commit_draw_note_texture()
     draw_fg()
+
+    activated.add(True)
+
+if args.video:
+    process = (
+        ffmpeg
+        .input('-', format='rawvideo', pixel_format='bgra', s='{}x{}'.format(1280, 720), framerate=60)
+        .vflip()
+        .output("./out/video.mkv", pix_fmt="yuv420p", vcodec="libx264", tune="animation", preset="veryslow")
+        .overwrite_output()
+        .run_async(pipe_stdin=True)
+    )
+    pbo_ids = (gl.GLuint * 2)()
+    gl.glGenBuffers(2, pbo_ids)
+    gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, pbo_ids[0])
+    gl.glBufferData(gl.GL_PIXEL_PACK_BUFFER, 4 * 1280 * 720, 0, gl.GL_DYNAMIC_READ)
+    gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, pbo_ids[1])
+    gl.glBufferData(gl.GL_PIXEL_PACK_BUFFER, 4 * 1280 * 720, 0, gl.GL_DYNAMIC_READ)
+    gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, 0)
+    current_pbo = 0
+else:
+    pyglet.clock.schedule_interval(update, 1 / 60)
+
+@window.event
+def on_draw():
+    gl.glEnable(gl.GL_BLEND)
+    gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
+    window.clear()
+
+    if args.video:
+        update(1/60)
 
     with note_program:
         note_program["offset_y"] = offset_y * y_multiplier
+    
+    with mid_program:
+        mid_program["offset_y"] = offset_y * y_multiplier
 
     with hold_program:
         hold_program["offset_y"] = offset_y * y_multiplier
@@ -1219,17 +1415,32 @@ def on_draw():
         flick_program["flick_offset"] = flick_offset
 
     batch.draw()
-
-    activated.add(True)
-    previous_time = current_time
     fps_display.draw()
+
+    if args.video:
+        global current_pbo
+        gl.glReadBuffer(gl.GL_BACK)
+        gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, pbo_ids[current_pbo])
+        gl.glReadPixels(0, 0, 1280, 720, gl.GL_BGRA, gl.GL_UNSIGNED_BYTE, 0)
+        current_pbo = (current_pbo + 1) % 2
+        gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, pbo_ids[current_pbo])
+        buffer = gl.glMapBuffer(gl.GL_PIXEL_PACK_BUFFER, gl.GL_READ_ONLY)
+        process.stdin.write(ctypes.cast(buffer, ctypes.POINTER(gl.GLubyte * (4 * 1280 * 720)))[0])
+        gl.glUnmapBuffer(gl.GL_PIXEL_PACK_BUFFER)
+        gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, 0)
+
+        if offset_time > t.end() + follow_time:
+            gl.glDeleteBuffers(2, pbo_ids)
+            process.stdin.close()
+            process.wait()
+            pyglet.app.exit()
 
 @window.push_handlers
 def on_key_press(symbol, modifiers):
     global pause
     global music_player
     global activated
-    if symbol == key.SPACE:
+    if not args.video and not args.audio and symbol == key.SPACE:
         pause = not pause
         if not pause:
             if music_offset + offset_time + judge_line_offset_s > 0:
@@ -1239,4 +1450,18 @@ def on_key_press(symbol, modifiers):
             activated = set()
             music_player.pause()
 
+@window.event
+def on_resize(width, height):
+    pass
+
 pyglet.app.run()
+
+if args.video and args.audio:
+    process = (
+        ffmpeg
+        .input("./out/video.mkv")
+        .output(ffmpeg.input("./out/audio.wav"), "./out/mix.mp4", vcodec="copy", acodec="aac", movflags="faststart")
+        .overwrite_output()
+        .run_async()
+    )
+    process.wait()

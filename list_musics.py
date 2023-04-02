@@ -66,7 +66,7 @@ if musics := client.master_data.musics:
     unreleased_musics = filter(lambda music: music.published_at and music.published_at > datetime.datetime.now(datetime.timezone.utc), musics)
     # unreleased_musics = musics
     for unreleased_music in sorted(unreleased_musics, key=lambda music: music.published_at if music.published_at else -1):
-        music_published_at = unreleased_music.published_at.date() if unreleased_music.published_at else None
+        music_published_at = f"{unreleased_music.published_at.astimezone().date()} {unreleased_music.published_at.astimezone().time()}" if unreleased_music.published_at else None
         music_id = unreleased_music.id
         music_categories = [category for category in unreleased_music.categories if category != MusicCategory.IMAGE] if unreleased_music.categories else []
         music_categories_str = f"[{'|'.join([CATEGORY[category.value] for category in music_categories if category.value and CATEGORY.get(category.value)])}]"if music_categories else ""

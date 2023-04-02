@@ -1,5 +1,6 @@
 from pjsekai.client import Client
 import UnityPy
+import UnityPy.config
 from UnityPy.tools.extractor import EXPORT_TYPES, export_obj
 
 import shutil
@@ -22,6 +23,8 @@ print("updating data ...")
 client.update_all()
 print("logging in ...")
 client.login(int(os.environ["USER_ID"]), os.environ["CREDENTIAL"])
+
+UnityPy.config.FALLBACK_UNITY_VERSION = client.platform.unity_version
 
 export_types_keys = list(EXPORT_TYPES.keys())
 
@@ -98,7 +101,7 @@ def load_asset(asset_bundle_str: str, force: bool = False) -> bool:
                 subprocess.run(["./vgmstream-cli", "-o", obj_dest.parent / "?n.wav", "-S", "0", obj_dest.with_suffix("")])
     
     (directory / "hash" / asset_bundle_str).parent.mkdir(parents=True, exist_ok=True)
-    with open(directory / "hash" / asset_bundle_str, "x") as f:
+    with open(directory / "hash" / asset_bundle_str, "w") as f:
         f.write(bundle_hash)
             
     print(f"updated bundle {asset_bundle_str}")
@@ -121,8 +124,15 @@ if __name__ == "__main__":
     asset_bundles =  []
 
     asset_bundles.extend([
-        # "live/2dmode/background/default",
-        # "live/note/default",
+        "shader/common",
+        "shader/live",
+        "shader/particles",
+        "shader/rp_common",
+        "shader/sandbox",
+        "effect_asset/live/skill/default",
+        "effect_asset/live/tap_effect/default",
+        "live/2dmode/background/default",
+        "live/note/default",
         "live/tap_se/default",
         "music/long/se_0333_01",
         "music/long/se_0321_01"

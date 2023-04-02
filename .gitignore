@@ -2,6 +2,7 @@ asset
 global-metadata
 media
 textures
+out
 master-data.json
 system-info.json
 user-data.json
